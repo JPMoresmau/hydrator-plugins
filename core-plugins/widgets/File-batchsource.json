@@ -79,7 +79,7 @@
       "label": "Advanced Properties",
       "properties": [
         {
-          "widget-type": "textbox",
+          "widget-type": "hidden",
           "label": "Input Format Class",
           "name": "inputFormatClass"
         },
@@ -101,9 +101,13 @@
           }
         },
         {
-          "widget-type": "textbox",
+          "widget-type": "hidden",
           "label": "Time Table",
           "name": "timeTable"
+        },
+        {
+          "widget-type": "hidden",
+          "name": "copyHeader"
         }
       ]
     }

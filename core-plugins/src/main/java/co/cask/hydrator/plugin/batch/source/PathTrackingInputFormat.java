@@ -44,9 +44,15 @@ import java.util.List;
 import javax.annotation.Nullable;
 
 /**
- * An input format that tracks which the file path each record was read from.
+ * An input format that tracks which the file path each record was read from. This InputFormat is a wrapper around
+ * underlying input formats. The responsibility of this class is to keep track of which file each record is reading
+ * from, and to add the file URI to each record. In addition, for text files, it can be configured to keep track
+ * of the header for the file, which underlying record readers can use.
+ *
+ * This is tightly coupled with {@link CombinePathTrackingInputFormat}.
  */
 public class PathTrackingInputFormat extends FileInputFormat<NullWritable, StructuredRecord> {
+  static final String COPY_HEADER = "path.tracking.copy.header";
   private static final String PATH_FIELD = "path.tracking.path.field";
   private static final String FILENAME_ONLY = "path.tracking.filename.only";
   private static final String FORMAT = "path.tracking.format";
@@ -56,7 +62,7 @@ public class PathTrackingInputFormat extends FileInputFormat<NullWritable, Struc
    * Configure the input format to use the specified schema and optional path field.
    */
   public static void configure(Job job, Configuration conf, @Nullable String pathField, boolean filenameOnly,
-                               String format, @Nullable String schema) {
+                               String format, @Nullable String schema, boolean shouldCopyHeader) {
     if (pathField != null) {
       conf.set(PATH_FIELD, pathField);
     }
@@ -74,6 +80,7 @@ public class PathTrackingInputFormat extends FileInputFormat<NullWritable, Struc
     } else if (format.equalsIgnoreCase("text")) {
       conf.set(SCHEMA, getTextOutputSchema(pathField).toString());
     }
+    conf.setBoolean(COPY_HEADER, shouldCopyHeader);
   }
 
   public static Schema getTextOutputSchema(@Nullable String pathField) {
@@ -104,11 +111,12 @@ public class PathTrackingInputFormat extends FileInputFormat<NullWritable, Struc
       throw new IllegalStateException("Input split is not a FileSplit.");
     }
     FileSplit fileSplit = (FileSplit) split;
-    String pathField = context.getConfiguration().get(PATH_FIELD);
-    boolean filenameOnly = context.getConfiguration().getBoolean(FILENAME_ONLY, false);
-    String format = context.getConfiguration().get(FORMAT);
+    Configuration hConf = context.getConfiguration();
+    String pathField = hConf.get(PATH_FIELD);
+    boolean filenameOnly = hConf.getBoolean(FILENAME_ONLY, false);
+    String format = hConf.get(FORMAT);
     String path = filenameOnly ? fileSplit.getPath().getName() : fileSplit.getPath().toUri().toString();
-    String schema = context.getConfiguration().get(SCHEMA);
+    String schema = hConf.get(SCHEMA);
     Schema parsedSchema = schema == null ? null : Schema.parseJson(schema);
     if ("avro".equalsIgnoreCase(format)) {
       RecordReader<AvroKey<GenericRecord>, NullWritable> delegate = (new AvroKeyInputFormat<GenericRecord>())
@@ -119,8 +127,9 @@ public class PathTrackingInputFormat extends FileInputFormat<NullWritable, Struc
         .createRecordReader(split, context);
       return new TrackingParquetRecordReader(delegate, pathField, path, parsedSchema);
     } else {
+      String header = hConf.get(CombinePathTrackingInputFormat.HEADER);
       RecordReader<LongWritable, Text> delegate = (new TextInputFormat()).createRecordReader(split, context);
-      return new TrackingTextRecordReader(delegate, pathField, path, parsedSchema);
+      return new TrackingTextRecordReader(delegate, pathField, path, parsedSchema, header);
     }
   }
 
@@ -176,20 +185,49 @@ public class PathTrackingInputFormat extends FileInputFormat<NullWritable, Struc
   }
 
   private static class TrackingTextRecordReader extends TrackingRecordReader<LongWritable, Text> {
+    private boolean emittedHeader;
+    private String header;
 
     private TrackingTextRecordReader(RecordReader<LongWritable, Text> delegate, @Nullable String pathField,
-                                     String path, Schema schema) {
+                                     String path, Schema schema, @Nullable String header) {
       super(delegate, pathField, path, schema);
+      this.header = header;
+    }
+
+    @Override
+    public void initialize(InputSplit split, TaskAttemptContext context) throws IOException, InterruptedException {
+      super.initialize(split, context);
+      emittedHeader = false;
     }
 
     public StructuredRecord.Builder startCurrentValue() throws IOException, InterruptedException {
       StructuredRecord.Builder recordBuilder = StructuredRecord.builder(schema);
-      LongWritable key = delegate.getCurrentKey();
-      Text text = delegate.getCurrentValue();
-
-      recordBuilder.set("offset", key.get());
-      recordBuilder.set("body", text.toString());
+      if (header != null && !emittedHeader) {
+        emittedHeader = true;
+        recordBuilder.set("offset", 0L);
+        recordBuilder.set("body", header);
+      } else {
+        recordBuilder.set("offset", delegate.getCurrentKey().get());
+        recordBuilder.set("body", delegate.getCurrentValue().toString());
+      }
       return recordBuilder;
+    }
+
+    @Override
+    public boolean nextKeyValue() throws IOException, InterruptedException {
+      if (header != null && !emittedHeader) {
+        return true;
+      }
+
+      if (delegate.nextKeyValue()) {
+        // if this record is the actual header and we've already emitted the copied header,
+        // skip this record so that the header is not emitted twice.
+        if (emittedHeader && delegate.getCurrentKey().get() == 0L) {
+          return delegate.nextKeyValue();
+        }
+        return true;
+      }
+      return false;
     }
   }
 
